@@ -12,6 +12,7 @@
 #include <util/prefix.h>
 #include <util/pretty.h>
 #include <util/std_expr.h>
+#include <util/type_byte_size.h>
 
 bool goto_symext::get_unwind_recursion(
   const irep_idt &identifier,
@@ -76,7 +77,41 @@ unsigned goto_symext::argument_assignments(
 
     if (is_nil_expr(*it1))
     {
-      ; // XXX jmorse, is this valid?
+      // In isolated function verification (--function mode), arguments are nil.
+      // For pointer parameters, we need to allocate valid objects so the function
+      // body can safely dereference them. This enables contract verification in isolation.
+      auto const &arg_type = function_type.arguments[name_idx];
+      if (is_pointer_type(arg_type))
+      {
+        // Get pointee type and size
+        const pointer_type2t &ptr_type = to_pointer_type(arg_type);
+        type2tc pointee_type = ptr_type.subtype;
+        
+        // Calculate size using type_byte_size_expr
+        expr2tc size_expr = type_byte_size_expr(pointee_type, &ns);
+        
+        // Create malloc sideeffect
+        expr2tc malloc_expr = sideeffect2tc(
+          arg_type,                // result type (pointer)
+          expr2tc(),               // operand (unused)
+          size_expr,               // size
+          std::vector<expr2tc>(),  // arguments
+          type2tc(),               // alloctype
+          sideeffect2t::malloc     // kind
+        );
+        
+        // Create LHS symbol for the parameter
+        expr2tc lhs = symbol2tc(arg_type, identifier);
+        
+        // Declare parameter first
+        symex_decl(code_decl2tc(arg_type, identifier));
+        
+        // Assign allocated memory to parameter
+        symex_assign(
+          code_assign2tc(lhs, malloc_expr),
+          !options.get_bool_option("generate-html-report"));
+      }
+      // For non-pointer parameters with nil argument, do nothing (keep uninitialized)
     }
     else if (is_constant_string2t(*it1))
     {
