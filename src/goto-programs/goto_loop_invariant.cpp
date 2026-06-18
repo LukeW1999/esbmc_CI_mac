@@ -326,6 +326,27 @@ static bool loop_has_constant_bound(const loopst &loop)
   return false;
 }
 
+// Does any assertion sit AFTER the loop (between the loop exit and the end of
+// the function)?  The bounded-loop wrong-TRUE risk is specific to such
+// post-loop assertions: the summary discharges them against an exit state whose
+// iteration cap has been abstracted away, so it proves the unbounded-completion
+// version.  When a loop's only assertions are IN-loop (re-checked every
+// iteration by the summary's preserve obligation), summarising is sound
+// regardless of the bound -- so we must not skip those (doing so loses
+// large-bound in-loop-assert TRUE tasks, e.g. `while(k<BIG){...;assert(I);}`,
+// to a BMC that cannot unroll BIG iterations).
+static bool
+loop_has_post_loop_assertion(const loopst &loop, goto_functiont &goto_function)
+{
+  goto_programt::targett exit = loop.get_original_loop_exit();
+  for (goto_programt::targett it = exit;
+       it != goto_function.body.instructions.end();
+       ++it)
+    if (it->is_assert())
+      return true;
+  return false;
+}
+
 void goto_loop_invariantt::convert_loop_with_invariant(loopst &loop)
 {
   // Get current loop head and loop exit
@@ -337,16 +358,19 @@ void goto_loop_invariantt::convert_loop_with_invariant(loopst &loop)
   if (invariants.empty())
     return;
 
-  // Soundness guard: do not summarise a constant-bounded loop. The summary
-  // abstracts the iteration cap and would prove the unbounded-completion
-  // property (wrong-TRUE on bounded-false tasks). Leaving the real loop in
-  // place lets k-induction/BMC decide it soundly. The leftover LOOP_INVARIANT
-  // annotation is a no-op in symex.
-  if (loop_has_constant_bound(loop))
+  // Soundness guard: do not summarise a constant-bounded loop *that is followed
+  // by an assertion*. The summary abstracts the iteration cap and would prove
+  // the unbounded-completion property (wrong-TRUE on bounded-false tasks) for a
+  // post-loop assertion. Leaving the real loop in place lets k-induction/BMC
+  // decide it soundly. A constant-bounded loop whose only assertions are
+  // in-loop is still summarised: the preserve obligation re-checks those every
+  // iteration, so the bound is irrelevant to their soundness.
+  if (loop_has_constant_bound(loop) &&
+      loop_has_post_loop_assertion(loop, goto_function))
   {
     log_status(
-      "loop-invariant: loop has a constant iteration bound; skipping unsound "
-      "summary and leaving it to k-induction/BMC");
+      "loop-invariant: constant-bounded loop with a post-loop assertion; "
+      "skipping unsound summary and leaving it to k-induction/BMC");
     return;
   }
 
