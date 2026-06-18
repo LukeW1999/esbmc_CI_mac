@@ -39,6 +39,7 @@
 #include <util/options.h>
 #include <irep2/irep2_utils.h>
 #include <map>
+#include <set>
 
 // ---------------------------------------------------------------------------
 // Shared helper: extract the loop invariant near a loop head
@@ -177,6 +178,154 @@ void goto_loop_invariantt::goto_loop_invariant()
   }
 }
 
+/// A *sufficient* syntactic condition that the loop runs a bounded number of
+/// iterations: it contains a monotone counter (a variable whose every body
+/// assignment is `v = v + c` for a positive constant c) and a branch that
+/// LEAVES the loop when that counter -- or a variable just copied from it --
+/// reaches a constant upper bound (`e < K` / `e <= K`). This covers ordinary
+/// for-loops and the SV-COMP `counter++ < N` idiom (increment at the loop head,
+/// guard testing a temporary copy), including a counter shared across nested
+/// loops and loops with extra early-exit `break`s (an early exit only makes the
+/// loop terminate sooner).
+///
+/// For such a loop the loop-invariant SUMMARY (havoc; assume(I && !guard)) is
+/// UNSOUND: it abstracts the iteration cap and proves the *unbounded-completion*
+/// property, producing wrong-TRUE on bounded-FALSE programs (the SV-COMP
+/// *_unwindbound* family). We therefore leave the real loop in place for
+/// k-induction / BMC, whose base case + unwinding assertion decides a bounded
+/// loop soundly. Genuinely unbounded / data-dependent loops are NOT matched
+/// (no constant bound), so their invariant summary -- which is sound there -- is
+/// kept and recovery is preserved.
+static bool loop_has_constant_bound(const loopst &loop)
+{
+  goto_programt::targett head = loop.get_original_loop_head();
+  goto_programt::targett exit = loop.get_original_loop_exit();
+
+  auto pos_const = [](const expr2tc &e) {
+    return is_constant_int2t(e) && to_constant_int2t(e).value.to_int64() > 0;
+  };
+  auto is_pos_inc = [&](const expr2tc &lhs, const expr2tc &rhs) {
+    if (!is_add2t(rhs))
+      return false;
+    const add2t &a = to_add2t(rhs);
+    return (a.side_1 == lhs && pos_const(a.side_2)) ||
+           (a.side_2 == lhs && pos_const(a.side_1));
+  };
+
+  // Pass 1: monotone counters = symbols whose EVERY body assignment is v=v+c
+  // (c>0). Multiple increments are fine (a counter shared across nested loops);
+  // any other assignment (reset, copy) disqualifies the symbol.
+  std::set<irep_idt> candidates, disqualified;
+  for (goto_programt::targett it = head; it != exit; ++it)
+  {
+    if (!it->is_assign())
+      continue;
+    const code_assign2t &as = to_code_assign2t(it->code);
+    if (!is_symbol2t(as.target))
+      continue;
+    const irep_idt name = to_symbol2t(as.target).get_symbol_name();
+    if (is_pos_inc(as.target, as.source))
+      candidates.insert(name);
+    else
+      disqualified.insert(name);
+  }
+  std::set<irep_idt> monotone;
+  for (const irep_idt &n : candidates)
+    if (!disqualified.count(n))
+      monotone.insert(n);
+  if (monotone.empty())
+    return false;
+
+  // Helper: is `name` a monotone counter or a current copy of one?
+  std::set<irep_idt> copies;
+  auto is_counter = [&](const expr2tc &e) {
+    return is_symbol2t(e) &&
+           (monotone.count(to_symbol2t(e).get_symbol_name()) ||
+            copies.count(to_symbol2t(e).get_symbol_name()));
+  };
+  // Helper: does the GOTO-out condition `g` fire when a monotone counter grows
+  // PAST a constant? Handles every encoding ESBMC may produce -- the raw
+  // `!(e < K)` / `!(e <= K)` and the form `--interval-analysis` canonicalises
+  // to, `e >= K` / `e > K` (and the constant-on-the-left mirrors).
+  auto exits_when_counter_large = [&](const expr2tc &guard) -> bool {
+    expr2tc c = guard;
+    bool neg = false;
+    if (is_not2t(c))
+    {
+      c = to_not2t(c).value;
+      neg = true;
+    }
+    int kind; // 0:<  1:<=  2:>  3:>=
+    if (is_lessthan2t(c))
+      kind = 0;
+    else if (is_lessthanequal2t(c))
+      kind = 1;
+    else if (is_greaterthan2t(c))
+      kind = 2;
+    else if (is_greaterthanequal2t(c))
+      kind = 3;
+    else
+      return false;
+    const expr2tc &lhs = *c->get_sub_expr(0);
+    const expr2tc &rhs = *c->get_sub_expr(1);
+    // counter on the left, constant on the right
+    if (is_counter(lhs) && is_constant_int2t(rhs))
+      return neg ? (kind == 0 || kind == 1) : (kind == 2 || kind == 3);
+    // constant on the left, counter on the right (mirrored)
+    if (is_constant_int2t(lhs) && is_counter(rhs))
+      return neg ? (kind == 2 || kind == 3) : (kind == 0 || kind == 1);
+    return false;
+  };
+
+  // Walk the loop, tracking copies of monotone counters; at each branch that
+  // EXITS the loop, test whether it bounds a counter above by a constant.
+  for (goto_programt::targett it = head; it != exit; ++it)
+  {
+    if (it->is_assign())
+    {
+      const code_assign2t &as = to_code_assign2t(it->code);
+      if (is_symbol2t(as.target))
+      {
+        const irep_idt t = to_symbol2t(as.target).get_symbol_name();
+        if (
+          is_symbol2t(as.source) &&
+          monotone.count(to_symbol2t(as.source).get_symbol_name()))
+          copies.insert(t);
+        else
+          copies.erase(t);
+      }
+      continue;
+    }
+    if (!it->is_goto() || is_nil_expr(it->guard) || is_true(it->guard))
+      continue;
+    // Does this branch leave the loop body [head, exit)?
+    bool exits = false;
+    for (const goto_programt::targett &tgt : it->targets)
+    {
+      if (tgt == exit)
+      {
+        exits = true;
+        break;
+      }
+      bool inside = false;
+      for (goto_programt::targett s = head; s != exit; ++s)
+        if (s == tgt)
+        {
+          inside = true;
+          break;
+        }
+      if (!inside)
+      {
+        exits = true;
+        break;
+      }
+    }
+    if (exits && exits_when_counter_large(it->guard))
+      return true;
+  }
+  return false;
+}
+
 void goto_loop_invariantt::convert_loop_with_invariant(loopst &loop)
 {
   // Get current loop head and loop exit
@@ -187,6 +336,19 @@ void goto_loop_invariantt::convert_loop_with_invariant(loopst &loop)
 
   if (invariants.empty())
     return;
+
+  // Soundness guard: do not summarise a constant-bounded loop. The summary
+  // abstracts the iteration cap and would prove the unbounded-completion
+  // property (wrong-TRUE on bounded-false tasks). Leaving the real loop in
+  // place lets k-induction/BMC decide it soundly. The leftover LOOP_INVARIANT
+  // annotation is a no-op in symex.
+  if (loop_has_constant_bound(loop))
+  {
+    log_status(
+      "loop-invariant: loop has a constant iteration bound; skipping unsound "
+      "summary and leaving it to k-induction/BMC");
+    return;
+  }
 
   log_status(
     "Processing {} loop invariant{}",
