@@ -326,6 +326,45 @@ static bool loop_has_constant_bound(const loopst &loop)
   return false;
 }
 
+// Is there a property check AFTER the loop (between the loop exit and the end of
+// the function)?  The bounded-loop wrong-TRUE risk is specific to such post-loop
+// checks: the summary discharges them against an exit state whose iteration cap
+// has been abstracted away, proving the unbounded-completion version.  When a
+// loop's only checks are IN-loop (re-verified every iteration by the summary's
+// preserve obligation), summarising is sound regardless of the bound.
+//
+// CRUCIAL: at this pass the SV-COMP property is NOT an ASSERT instruction -- it
+// is a FUNCTION_CALL to __VERIFIER_assert / reach_error / __assert_fail /
+// __VERIFIER_error / abort (reach_error's own ASSERT 0 lives in a separate
+// function).  A previous version checked only is_assert() and therefore missed
+// these, summarised bounded-false loops, and reintroduced 26 wrong-TRUE.  So we
+// match both is_assert() and calls to the assertion/error family (by name,
+// conservatively: any hit means "skip", which errs on the sound side).
+static bool
+loop_has_post_loop_assertion(const loopst &loop, goto_functiont &goto_function)
+{
+  auto is_property_call = [](const goto_programt::instructiont &ins) -> bool {
+    if (!ins.is_function_call() || !is_code_function_call2t(ins.code))
+      return false;
+    const code_function_call2t &call = to_code_function_call2t(ins.code);
+    if (!is_symbol2t(call.function))
+      return false;
+    const std::string name = id2string(to_symbol2t(call.function).thename);
+    return name.find("__VERIFIER_assert") != std::string::npos ||
+           name.find("reach_error") != std::string::npos ||
+           name.find("__assert_fail") != std::string::npos ||
+           name.find("__VERIFIER_error") != std::string::npos ||
+           name.find("abort") != std::string::npos;
+  };
+  goto_programt::targett exit = loop.get_original_loop_exit();
+  for (goto_programt::targett it = exit;
+       it != goto_function.body.instructions.end();
+       ++it)
+    if (it->is_assert() || is_property_call(*it))
+      return true;
+  return false;
+}
+
 void goto_loop_invariantt::convert_loop_with_invariant(loopst &loop)
 {
   // Get current loop head and loop exit
@@ -337,16 +376,19 @@ void goto_loop_invariantt::convert_loop_with_invariant(loopst &loop)
   if (invariants.empty())
     return;
 
-  // Soundness guard: do not summarise a constant-bounded loop. The summary
-  // abstracts the iteration cap and would prove the unbounded-completion
-  // property (wrong-TRUE on bounded-false tasks). Leaving the real loop in
-  // place lets k-induction/BMC decide it soundly. The leftover LOOP_INVARIANT
-  // annotation is a no-op in symex.
-  if (loop_has_constant_bound(loop))
+  // Soundness guard: do not summarise a constant-bounded loop that is FOLLOWED
+  // BY A PROPERTY CHECK. The summary abstracts the iteration cap and would prove
+  // the unbounded-completion property (wrong-TRUE on bounded-false tasks) for a
+  // post-loop assertion/error call. Leaving the real loop in place lets
+  // k-induction/BMC decide it soundly. A constant-bounded loop whose only checks
+  // are in-loop is still summarised (the preserve obligation re-checks them every
+  // iteration, so the bound is irrelevant to their soundness).
+  if (loop_has_constant_bound(loop) &&
+      loop_has_post_loop_assertion(loop, goto_function))
   {
     log_status(
-      "loop-invariant: loop has a constant iteration bound; skipping unsound "
-      "summary and leaving it to k-induction/BMC");
+      "loop-invariant: constant-bounded loop with a post-loop property check; "
+      "skipping unsound summary and leaving it to k-induction/BMC");
     return;
   }
 
